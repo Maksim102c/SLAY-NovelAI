@@ -1,12 +1,18 @@
 {
-    "display_name": "💅🔥 SLAY Images",
-    "loading_order": 100,
+    "display_name": "💅🔥 SLAY Images (NovelAI + V5)",
+    "loading_order": 10,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "wewwaistyping + aceeenvw + 0xl0cal",
+    "author": "wewwaistyping + aceeenvw + 0xl0cal + Maksim102c",
     "version": "5.1.0",
-    "homePage": "https://github.com/Maksim102c/SLAYimages",
-    "auto_update": true
+    "homePage": "https://github.com/Maksim102c/SLAY-NovelAI",
+    "auto_update": true,
+    "hooks": {
+        "install": "onSlayNaiInstall",
+        "enable": "onSlayNaiEnable",
+        "disable": "onSlayNaiDisable",
+        "delete": "onSlayNaiDelete"
+    }
 }
