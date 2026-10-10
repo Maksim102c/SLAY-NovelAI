@@ -2869,6 +2869,7 @@ const defaultSettings = Object.freeze({
     naisteraVideoEveryN: 1,
     // NovelAI Diffusion (native ST /api/novelai/generate-image)
     novelModel: 'nai-diffusion-5-full',
+    novelCustomModel: '',
     novelResolution: 'auto',
     novelSampler: 'k_euler_ancestral',
     novelScheduler: 'karras',
@@ -2947,6 +2948,7 @@ function isGeminiModel(modelId) {
 const NAISTERA_MODELS = Object.freeze(['grok', 'nano banana', 'grok-pro', 'novelai']);
 const NOVELAI_MODELS = Object.freeze([
     { value: 'nai-diffusion-5-full', label: 'NAI Diffusion V5 Full (Новинка)' },
+    { value: 'nai-diffusion-5-full-medium', label: 'NAI Diffusion V5 Full Medium (Новинка)' },
     { value: 'nai-diffusion-5-curated', label: 'NAI Diffusion V5 Curated (Новинка)' },
     { value: 'nai-diffusion-4-5-full', label: 'NAI Diffusion Anime V4.5 Full' },
     { value: 'nai-diffusion-4-5-curated', label: 'NAI Diffusion Anime V4.5 Curated' },
@@ -2955,7 +2957,20 @@ const NOVELAI_MODELS = Object.freeze([
     { value: 'nai-diffusion-3', label: 'NAI Diffusion Anime V3' },
     { value: 'nai-diffusion-furry-3', label: 'NAI Diffusion Furry V3' },
     { value: 'nai-diffusion-2', label: 'NAI Diffusion Anime V2' },
+    { value: 'custom', label: 'Своя модель (ввести ID вручную)...' },
 ]);
+function isPredefinedNovelModel(modelId) {
+    return Boolean(modelId && NOVELAI_MODELS.some(m => m.value === modelId && m.value !== 'custom'));
+}
+function getEffectiveNovelModel(settingsObj) {
+    if (!settingsObj) return 'nai-diffusion-5-full';
+    const m = settingsObj.novelModel || 'nai-diffusion-5-full';
+    if (m === 'custom' || !isPredefinedNovelModel(m)) {
+        const custom = String(settingsObj.novelCustomModel || (m !== 'custom' ? m : '')).trim();
+        return custom || 'nai-diffusion-5-full';
+    }
+    return m;
+}
 const NOVELAI_RESOLUTIONS = Object.freeze([
     { value: 'auto', label: 'Из промпта (Авто: 832×1216 / 1216×832 / 1024×1024)' },
     { value: '832x1216', label: '832×1216 (Портрет 2:3 — Opus Free)' },
@@ -4676,8 +4691,8 @@ async function generateImageNovelAI(prompt, style, options = {}) {
         await syncNovelApiKeyIfNeeded(settings.apiKey);
     }
 
-    const model = settings.novelModel || 'nai-diffusion-5-full';
-    const isV5 = model.startsWith('nai-diffusion-5');
+    const model = getEffectiveNovelModel(settings);
+    const isV5 = model.startsWith('nai-diffusion-5') || model.includes('diffusion-5');
     const isV4 = model.includes('nai-diffusion-4') || isV5;
     const sampler = settings.novelSampler || 'k_euler_ancestral';
     const scheduler = isV5 ? 'karras' : (settings.novelScheduler || 'karras');
@@ -7004,7 +7019,8 @@ function createSettingsUI() {
                     <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="slay_naistera_model_row"><label>Модель Naistera</label><select id="slay_naistera_model" class="flex1"><option value="grok" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok' ? 'selected' : ''}>Grok</option><option value="nano banana" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana' ? 'selected' : ''}>Nano Banana</option><option value="grok-pro" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok-pro' ? 'selected' : ''}>Grok Pro</option><option value="novelai" ${normalizeNaisteraModel(settings.naisteraModel) === 'novelai' ? 'selected' : ''}>NovelAI</option></select></div>
                     <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="slay_naistera_aspect_row"><label>Соотношение</label><select id="slay_naistera_aspect_ratio" class="flex1"><option value="auto" ${(settings.naisteraAspectRatio || 'auto') === 'auto' ? 'selected' : ''}>Из промпта</option><option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option><option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option><option value="2:3" ${settings.naisteraAspectRatio === '2:3' ? 'selected' : ''}>2:3</option></select></div>
                     <div id="slay_novel_params" class="${settings.apiType === 'novelai' ? '' : 'iig-hidden'}">
-                        <div class="flex-row"><label>Модель NovelAI</label><select id="slay_novel_model" class="flex1">${NOVELAI_MODELS.map(m => `<option value="${m.value}" ${(settings.novelModel || 'nai-diffusion-5-full') === m.value ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
+                        <div class="flex-row"><label>Модель NovelAI</label><select id="slay_novel_model" class="flex1">${NOVELAI_MODELS.map(m => `<option value="${m.value}" ${(isPredefinedNovelModel(settings.novelModel || 'nai-diffusion-5-full') ? (settings.novelModel || 'nai-diffusion-5-full') : 'custom') === m.value ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
+                        <div class="flex-row ${isPredefinedNovelModel(settings.novelModel || 'nai-diffusion-5-full') ? 'iig-hidden' : ''}" id="slay_novel_custom_model_row"><label>ID своей модели</label><input type="text" id="slay_novel_custom_model" class="text_pole flex1" value="${sanitizeForHtml(settings.novelCustomModel || (!isPredefinedNovelModel(settings.novelModel || 'nai-diffusion-5-full') && settings.novelModel !== 'custom' ? (settings.novelModel || '') : ''))}" placeholder="например: nai-diffusion-5-curated-medium"></div>
                         <div class="flex-row"><label>Разрешение</label><select id="slay_novel_resolution" class="flex1">${NOVELAI_RESOLUTIONS.map(r => `<option value="${r.value}" ${(settings.novelResolution || 'auto') === r.value ? 'selected' : ''}>${r.label}</option>`).join('')}</select></div>
                         <div class="flex-row"><label>Сэмплер</label><select id="slay_novel_sampler" class="flex1">${NOVELAI_SAMPLERS.map(s => `<option value="${s.value}" ${(settings.novelSampler || 'k_euler_ancestral') === s.value ? 'selected' : ''}>${s.label}</option>`).join('')}</select></div>
                         <div class="flex-row" id="slay_novel_scheduler_row"><label>Планировщик</label><select id="slay_novel_scheduler" class="flex1">${NOVELAI_SCHEDULERS.map(s => `<option value="${s.value}" ${(settings.novelScheduler || 'karras') === s.value ? 'selected' : ''}>${s.label}</option>`).join('')}</select></div>
@@ -8445,8 +8461,10 @@ function bindSettingsEvents() {
         document.getElementById('slay_novel_hint')?.classList.toggle('iig-hidden', !isNovel);
         document.getElementById('slay_novel_params')?.classList.toggle('iig-hidden', !isNovel);
         if (isNovel) {
-            const nModel = String(settings.novelModel || 'nai-diffusion-5-full');
-            const isV5 = nModel.startsWith('nai-diffusion-5');
+            const isCustomNovel = !isPredefinedNovelModel(settings.novelModel || 'nai-diffusion-5-full') || settings.novelModel === 'custom';
+            document.getElementById('slay_novel_custom_model_row')?.classList.toggle('iig-hidden', !isCustomNovel);
+            const nModel = String(getEffectiveNovelModel(settings));
+            const isV5 = nModel.startsWith('nai-diffusion-5') || nModel.includes('diffusion-5');
             const isV4Plus = nModel.includes('nai-diffusion-4') || isV5;
             const isDdim = (settings.novelSampler || 'k_euler_ancestral') === 'ddim';
             const canSmea = !isV4Plus && !isDdim;
@@ -8547,6 +8565,7 @@ function bindSettingsEvents() {
         settings.apiKey = p.apiKey || '';
         settings.model = p.model || '';
         if (p.novelModel) settings.novelModel = p.novelModel;
+        if (p.novelCustomModel !== undefined) settings.novelCustomModel = p.novelCustomModel;
         settings.customBodyFormat = p.customBodyFormat || 'chat';
         saveSettings();
         // Sync visible inputs to the applied profile
@@ -8559,7 +8578,13 @@ function bindSettingsEvents() {
         const modelInput = document.getElementById('slay_model');
         if (modelInput) modelInput.value = settings.model;
         const novelModelSel = document.getElementById('slay_novel_model');
-        if (novelModelSel && settings.novelModel) novelModelSel.value = settings.novelModel;
+        if (novelModelSel && settings.novelModel) {
+            novelModelSel.value = isPredefinedNovelModel(settings.novelModel) ? settings.novelModel : 'custom';
+        }
+        const novelCustomInput = document.getElementById('slay_novel_custom_model');
+        if (novelCustomInput) {
+            novelCustomInput.value = settings.novelCustomModel || (!isPredefinedNovelModel(settings.novelModel) && settings.novelModel !== 'custom' ? settings.novelModel : '') || '';
+        }
         const fmtSel = document.getElementById('slay_custom_body_format');
         if (fmtSel) fmtSel.value = settings.customBodyFormat;
         updateVisibility();
@@ -8567,7 +8592,7 @@ function bindSettingsEvents() {
     });
     document.getElementById('slay_conn_profile_save')?.addEventListener('click', async () => {
         const defaultName = settings.apiType === 'novelai'
-            ? `NovelAI (${settings.novelModel || 'V5'})`
+            ? `NovelAI (${getEffectiveNovelModel(settings)})`
             : (settings.model || settings.endpoint?.replace(/^https?:\/\//, '').split('/')[0] || 'профиль');
         const raw = await slayPromptInput('Имя профиля подключения:', defaultName);
         const name = (raw || '').trim();
@@ -8580,6 +8605,7 @@ function bindSettingsEvents() {
             apiKey: settings.apiKey,
             model: settings.model,
             novelModel: settings.novelModel || 'nai-diffusion-5-full',
+            novelCustomModel: settings.novelCustomModel || '',
             customBodyFormat: settings.customBodyFormat || 'chat',
         };
         const existing = profiles.findIndex(x => x.name === name);
@@ -8728,6 +8754,7 @@ function bindSettingsEvents() {
     document.getElementById('slay_naistera_aspect_ratio')?.addEventListener('change', (e) => { settings.naisteraAspectRatio = e.target.value; saveSettings(); });
     // NovelAI parameter bindings
     document.getElementById('slay_novel_model')?.addEventListener('change', (e) => { settings.novelModel = e.target.value; saveSettings(); updateVisibility(); });
+    document.getElementById('slay_novel_custom_model')?.addEventListener('input', (e) => { settings.novelCustomModel = e.target.value.trim(); saveSettings(); updateVisibility(); });
     document.getElementById('slay_novel_resolution')?.addEventListener('change', (e) => { settings.novelResolution = e.target.value; saveSettings(); });
     document.getElementById('slay_novel_sampler')?.addEventListener('change', (e) => { settings.novelSampler = e.target.value; saveSettings(); updateVisibility(); });
     document.getElementById('slay_novel_scheduler')?.addEventListener('change', (e) => { settings.novelScheduler = e.target.value; saveSettings(); });
