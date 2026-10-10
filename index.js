@@ -2932,7 +2932,7 @@ const VIDEO_MODEL_KEYWORDS = [
 ];
 
 function isImageModel(modelId) {
-    const mid = modelId.toLowerCase();
+    const mid = String(modelId || '').toLowerCase();
     for (const kw of VIDEO_MODEL_KEYWORDS) { if (mid.includes(kw)) return false; }
     if (mid.includes('vision') && mid.includes('preview')) return false;
     for (const kw of IMAGE_MODEL_KEYWORDS) { if (mid.includes(kw)) return true; }
@@ -2940,7 +2940,7 @@ function isImageModel(modelId) {
 }
 
 function isGeminiModel(modelId) {
-    return modelId.toLowerCase().includes('nano-banana');
+    return String(modelId || '').toLowerCase().includes('nano-banana');
 }
 
 // ── Naistera/NovelAI/endpoint helpers (from sillyimages-master) ──
@@ -3297,7 +3297,7 @@ function nameIsInPrompt(rawName, lowerPrompt) {
 }
 
 function matchNpcReferences(prompt, npcList) {
-    if (!prompt || !npcList || npcList.length === 0) return [];
+    if (!prompt || typeof prompt !== 'string' || !npcList || npcList.length === 0) return [];
     const lowerPrompt = prompt.toLowerCase();
     const matched = [];
     for (const npc of npcList) {
@@ -5305,6 +5305,51 @@ function findLiveImgByInstruction(detachedImg) {
     return null;
 }
 
+function normalizeIigInstructionData(rawData, mediaEl = null) {
+    let d = rawData;
+    if (typeof d === 'string') {
+        try { d = JSON.parse(d); } catch (_) { return { prompt: d, style: '' }; }
+    }
+    if (!d || typeof d !== 'object') d = {};
+    let prompt = d.prompt ?? d.Prompt ?? d.PROMPT ?? d.promt ?? d.Promt ?? d.propmt ?? d.promp ?? d.prmpt
+        ?? d['промпт'] ?? d['промт'] ?? d.positive ?? d.positive_prompt ?? d.image_prompt ?? d.imagePrompt
+        ?? d.description ?? d.Description ?? d.tags ?? d.text ?? d.scene ?? d.query ?? d.caption
+        ?? d.parameters?.prompt ?? d.data?.prompt ?? '';
+    if (!prompt) {
+        const metaKeys = new Set(['style', 'aspect_ratio', 'aspectratio', 'image_size', 'imagesize', 'quality', 'preset', 'model', 'seed', 'steps', 'scale', 'sampler', 'negative', 'negative_prompt', 'uc', 'width', 'height']);
+        for (const [k, v] of Object.entries(d)) {
+            if (!metaKeys.has(k.toLowerCase()) && typeof v === 'string' && v.trim()) {
+                prompt = v;
+                break;
+            }
+        }
+    }
+    let style = d.style ?? d.Style ?? d.STYLE ?? '';
+    if (!prompt && mediaEl && typeof mediaEl.getAttribute === 'function') {
+        const attrPrompt = mediaEl.getAttribute('prompt') || mediaEl.getAttribute('data-prompt') || mediaEl.getAttribute('alt') || '';
+        if (attrPrompt.trim()) {
+            prompt = attrPrompt;
+        } else {
+            const titleAttr = mediaEl.getAttribute('title') || '';
+            const m = titleAttr.match(/Prompt:\s*([\s\S]+)$/i);
+            if (m && m[1].trim()) prompt = m[1].trim();
+        }
+    }
+    if (!prompt && style) {
+        prompt = style;
+        style = '';
+    }
+    return {
+        ...d,
+        prompt: String(prompt ?? ''),
+        style: String(style ?? ''),
+        aspect_ratio: d.aspect_ratio || d.aspectRatio || null,
+        image_size: d.image_size || d.imageSize || null,
+        quality: d.quality || null,
+        preset: d.preset || null,
+    };
+}
+
 // Wrap a generated <img> (with data-iig-instruction) in a container and attach a top-left regen button.
 // Idempotent — safe to call multiple times on the same img. Works for newly-generated images AND
 // already-rendered ones (e.g. after page reload, chat swipe).
@@ -5345,6 +5390,7 @@ function attachRegenButton(imgEl) {
                 .replace(/&#39;/g, "'").replace(/&#34;/g, '"').replace(/&amp;/g, '&');
             try { data = JSON.parse(decoded); }
             catch (_) { data = JSON.parse(decoded.replace(/'/g, '"')); }
+            data = normalizeIigInstructionData(data, imgEl);
         } catch (err) {
             toastr.error('Не удалось распарсить параметры картинки', 'SLAY Images');
             icon.className = origIconClass; btn.classList.remove('iig-regen-busy'); return;
@@ -5570,7 +5616,8 @@ function buildPersistedVideoTag(templateHtml, persistedSrc, posterSrc = '') {
 // why only Russian names broke. Only touches &#...; patterns — safe for everything
 // else. Bonus: the model also receives clean Cyrillic instead of entity text.
 function decodeNumericEntities(str) {
-    if (typeof str !== 'string' || str.indexOf('&#') === -1) return str;
+    if (typeof str !== 'string') return String(str ?? '');
+    if (str.indexOf('&#') === -1) return str;
     return str
         .replace(/&#x([0-9a-fA-F]+);/g, (m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch (e) { return m; } })
         .replace(/&#(\d+);/g, (m, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch (e) { return m; } });
@@ -5583,6 +5630,12 @@ function decodeNumericEntities(str) {
 async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
     validateSettings();
     const settings = getSettings();
+    prompt = typeof prompt === 'string' ? prompt : String(prompt ?? '');
+    style = typeof style === 'string' ? style : String(style ?? '');
+    if (!prompt.trim() && style.trim()) {
+        prompt = style;
+        style = '';
+    }
     // Normalize the prompt BEFORE name-matching and before it's sent to the API.
     // This is the single chokepoint where charInPrompt/userInPrompt are computed
     // and where the request body is built, so decoding here fixes both.
@@ -5593,6 +5646,9 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             const m = (_before.match(/&#x?[0-9a-fA-F]+;/g) || []).slice(0, 6).join(' ');
             iigLog('INFO', `decoded numeric HTML entities in prompt (sample: ${m}) — Cyrillic names should now match`);
         }
+    }
+    if (!prompt.trim()) {
+        throw new Error('В теге картинки пустой промпт — нейросеть (LLM) не записала описание сцены в тег');
     }
     // Override with user-selected SLAY style if configured
     if (settings.slayStyle) {
@@ -5904,7 +5960,7 @@ async function parseImageTags(text, options = {}) {
 
         try {
             let normalizedJson = instructionJson.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#39;/g, "'").replace(/&#34;/g, '"').replace(/&amp;/g, '&');
-            const data = JSON.parse(normalizedJson);
+            const data = normalizeIigInstructionData(JSON.parse(normalizedJson));
             tags.push({ fullMatch: fullImgTag, index: mediaStart, style: data.style || '', prompt: data.prompt || '', aspectRatio: data.aspect_ratio || data.aspectRatio || null, preset: data.preset || null, imageSize: data.image_size || data.imageSize || null, quality: data.quality || null, isNewFormat: true, mediaTagName: tagName, existingSrc: hasPath ? srcValue : null });
             iigLog('INFO', `Found NEW tag: ${data.prompt?.substring(0, 50)}`);
         } catch (e) { iigLog('WARN', `Parse failed: ${instructionJson.substring(0, 100)}`); }
@@ -5931,7 +5987,7 @@ async function parseImageTags(text, options = {}) {
         if (!text.substring(jsonEnd).startsWith(']')) { searchStart = jsonEnd; continue; }
         const tagOnly = text.substring(markerIndex, jsonEnd + 1);
         try {
-            const data = JSON.parse(jsonStr.replace(/'/g, '"'));
+            const data = normalizeIigInstructionData(JSON.parse(jsonStr.replace(/'/g, '"')));
             tags.push({ fullMatch: tagOnly, index: markerIndex, style: data.style || '', prompt: data.prompt || '', aspectRatio: data.aspect_ratio || data.aspectRatio || null, preset: data.preset || null, imageSize: data.image_size || data.imageSize || null, quality: data.quality || null, isNewFormat: false });
             iigLog('INFO', `Found LEGACY tag: ${data.prompt?.substring(0, 50)}`);
         } catch (e) { iigLog('WARN', `Legacy parse failed: ${jsonStr.substring(0, 100)}`); }
@@ -6007,7 +6063,7 @@ function getErrorImagePath() {
     // await import(), which creates no script element — but it costs nothing and
     // covers builds that inject a tag.)
     const matchesUs = (p) => {
-        const s = p.toLowerCase();
+        const s = String(p || '').toLowerCase();
         return s.includes('slay') || s.includes('sillyimages') || s.includes('notsosillynotsoimages') || s.includes('inline_image_gen');
     };
     for (const script of document.querySelectorAll('script[src*="index.js"]')) {
@@ -6110,6 +6166,7 @@ async function retryFailedGeneration(errorEl, instructionJsonStr) {
             .replace(/&#39;/g, "'").replace(/&#34;/g, '"').replace(/&amp;/g, '&');
         try { data = JSON.parse(decoded); }
         catch (_) { data = JSON.parse(decoded.replace(/'/g, '"')); }
+        data = normalizeIigInstructionData(data, errorEl);
     } catch (err) {
         toastr.error('Не удалось распарсить параметры картинки', 'SLAY Images');
         errorEl.dataset.iigRetrying = '0';
