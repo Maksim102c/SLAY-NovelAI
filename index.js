@@ -28,12 +28,80 @@
  */
 const SLAY_VERSION = '5.1.0';
 
+const SELF_EXT_NAMES = ['third-party/SLAY-NovelAI', 'SLAY-NovelAI'];
+const ORIG_EXT_NAMES = ['third-party/SLAYimages', 'SLAYimages'];
+
+function isSlayNaiDisabled() {
+    try {
+        const dis = SillyTavern.getContext()?.extensionSettings?.disabledExtensions;
+        return Array.isArray(dis) && SELF_EXT_NAMES.some(n => dis.includes(n));
+    } catch (_) {
+        return false;
+    }
+}
+
+function pauseOrigSlay() {
+    try {
+        const ctx = SillyTavern.getContext();
+        const dis = ctx?.extensionSettings?.disabledExtensions;
+        if (!Array.isArray(dis)) return false;
+        let changed = false;
+        if (!dis.includes('third-party/SLAYimages')) {
+            dis.push('third-party/SLAYimages');
+            changed = true;
+        }
+        if (changed) ctx?.saveSettingsDebounced?.();
+        return changed;
+    } catch (_) {
+        return false;
+    }
+}
+
+function resumeOrigSlay() {
+    try {
+        const ctx = SillyTavern.getContext();
+        const dis = ctx?.extensionSettings?.disabledExtensions;
+        if (!Array.isArray(dis)) return;
+        for (const name of ORIG_EXT_NAMES) {
+            let idx;
+            while ((idx = dis.indexOf(name)) !== -1) dis.splice(idx, 1);
+        }
+        ctx?.saveSettingsDebounced?.();
+    } catch (_) {}
+}
+
+export async function onSlayNaiInstall() {
+    pauseOrigSlay();
+    if (typeof toastr !== 'undefined') {
+        toastr.info('Оригинальный SLAY поставлен на паузу (удалять его не нужно, база рефов и гардероб общие). Перезагрузка...', 'SLAY + NovelAI', { timeOut: 3000 });
+    }
+    setTimeout(() => location.reload(), 1200);
+}
+
+export async function onSlayNaiEnable() {
+    pauseOrigSlay();
+}
+
+export async function onSlayNaiDisable() {
+    resumeOrigSlay();
+}
+
+export async function onSlayNaiDelete() {
+    resumeOrigSlay();
+}
+
+const _slayNaiWasOrigRunningInTab = Boolean(window.slayWardrobe || document.getElementById('slay_enabled'));
+if (!isSlayNaiDisabled()) {
+    pauseOrigSlay();
+}
+
 /* ╔═══════════════════════════════════════════════════════════════╗
    ║  MODULE 1: SlayWardrobe                                       ║
    ╚═══════════════════════════════════════════════════════════════╝ */
 
 (function initWardrobe() {
     'use strict';
+    if (isSlayNaiDisabled() || _slayNaiWasOrigRunningInTab) return;
     const SW = 'slay_wardrobe';
 
     function uid() { return Date.now().toString(36) + Math.random().toString(36).substring(2, 8); }
@@ -8663,6 +8731,11 @@ function updateHeaderStatusDot() {
 
 // ── Initialization ──
 (function init() {
+    if (isSlayNaiDisabled()) return;
+    if (_slayNaiWasOrigRunningInTab) {
+        setTimeout(() => location.reload(), 1200);
+        return;
+    }
     const context = SillyTavern.getContext();
     iigLog('INFO', `Initializing Slay Images v${SLAY_VERSION}`);
 
