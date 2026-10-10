@@ -4520,6 +4520,156 @@ async function syncNovelApiKeyIfNeeded(rawKey) {
     return true;
 }
 
+function parseNovelAICharacters(basePrompt, baseNegative, options = {}) {
+    const cleanBase = String(basePrompt || '').replace(STYLE_BLOCK_RE, '').trim();
+    const rawChars = Array.isArray(options.characters) ? options.characters : [];
+    const parsedChars = [];
+    let hasCoords = false;
+
+    if (rawChars.length > 0) {
+        for (const c of rawChars) {
+            if (!c) continue;
+            if (typeof c === 'string') {
+                const p = c.replace(STYLE_BLOCK_RE, '').replace(/^[\s,]+|[\s,]+$/g, '').trim();
+                if (p) parsedChars.push({ name: '', prompt: p, uc: '', center: { x: 0.5, y: 0.5 }, hasCoords: false });
+                continue;
+            }
+            const p = String(c.prompt ?? c.char_caption ?? c.tags ?? c.description ?? '')
+                .replace(STYLE_BLOCK_RE, '')
+                .replace(/^[\s,]+|[\s,]+$/g, '')
+                .trim();
+            if (!p) continue;
+            const uc = String(c.uc ?? c.negative ?? c.negative_prompt ?? '')
+                .replace(/^[\s,]+|[\s,]+$/g, '')
+                .trim();
+            const centerRaw = c.center ?? (Array.isArray(c.centers) ? c.centers[0] : null);
+            const cx = Number(centerRaw?.x);
+            const cy = Number(centerRaw?.y);
+            const validCoord = centerRaw != null && Number.isFinite(cx) && Number.isFinite(cy);
+            if (validCoord) hasCoords = true;
+            parsedChars.push({
+                name: String(c.name ?? c.char ?? c.character ?? '').trim(),
+                prompt: p,
+                uc,
+                center: validCoord
+                    ? { x: Math.max(0, Math.min(1, cx)), y: Math.max(0, Math.min(1, cy)) }
+                    : { x: 0.5, y: 0.5 },
+                hasCoords: validCoord,
+            });
+        }
+    } else if (cleanBase.includes('|')) {
+        const posParts = cleanBase.split(/\\?\|/u).map(s => s.replace(/^[\s,]+|[\s,]+$/g, '').trim());
+        const negParts = String(baseNegative || '').split(/\\?\|/u).map(s => s.replace(/^[\s,]+|[\s,]+$/g, '').trim());
+        const baseOnly = posParts[0] || '';
+        const charPos = posParts.slice(1);
+        const charNeg = negParts.slice(1);
+        for (let i = 0; i < charPos.length; i++) {
+            if (!charPos[i]) continue;
+            parsedChars.push({
+                name: '',
+                prompt: charPos[i],
+                uc: charNeg[i] || '',
+                center: { x: 0.5, y: 0.5 },
+                hasCoords: false,
+            });
+        }
+        return { basePrompt: baseOnly, baseNegative: negParts[0] || '', parsedChars, hasCoords: false };
+    }
+
+    return { basePrompt: cleanBase, baseNegative: String(baseNegative || '').trim(), parsedChars, hasCoords };
+}
+
+function uint8ToBase64(u8) {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < u8.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, u8.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+}
+
+function extractPngSliceFromBytes(bytes) {
+    const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    const IEND_CRC = [0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
+    let start = -1;
+    for (let i = 0; i <= bytes.length - 8; i++) {
+        if (PNG_SIG.every((b, j) => bytes[i + j] === b)) { start = i; break; }
+    }
+    if (start === -1) return null;
+    for (let i = start + 8; i <= bytes.length - 8; i++) {
+        if (IEND_CRC.every((b, j) => bytes[i + j] === b)) {
+            return bytes.subarray(start, i + 8);
+        }
+    }
+    return bytes.subarray(start);
+}
+
+async function extractNovelAIImageFromArrayBuffer(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    if (!bytes.length) throw new Error('Пустой ответ от NovelAI');
+
+    // 1. JSON response ({ images: [{ image: "..." }] } or raw base64 string)
+    if (bytes[0] === 0x7b || bytes[0] === 0x5b) {
+        const text = new TextDecoder().decode(bytes).trim();
+        const parsed = JSON.parse(text);
+        const b64 = parsed?.images?.[0]?.image || parsed?.image || parsed?.data?.[0]?.b64_json || parsed?.output;
+        if (typeof b64 === 'string' && b64.trim()) {
+            const clean = b64.trim();
+            return clean.startsWith('data:') ? clean : `data:image/png;base64,${clean}`;
+        }
+        throw new Error(`NovelAI JSON response missing image data: ${text.slice(0, 200)}`);
+    }
+
+    // 2. ZIP archive (PK\x03\x04)
+    if (bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const method = view.getUint16(8, true);
+        let compSize = view.getUint32(18, true);
+        const fnLen = view.getUint16(26, true);
+        const extLen = view.getUint16(28, true);
+        const dataOffset = 30 + fnLen + extLen;
+
+        if (!compSize) {
+            for (let i = bytes.length - 46; i >= dataOffset; i--) {
+                if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x01 && bytes[i + 3] === 0x02) {
+                    compSize = view.getUint32(i + 20, true);
+                    break;
+                }
+            }
+        }
+
+        const rawEntry = compSize > 0 ? bytes.subarray(dataOffset, dataOffset + compSize) : bytes.subarray(dataOffset);
+        if (method === 0) {
+            const pngSlice = extractPngSliceFromBytes(rawEntry) || rawEntry;
+            return `data:image/png;base64,${uint8ToBase64(pngSlice)}`;
+        }
+        if (method === 8 && typeof DecompressionStream !== 'undefined') {
+            const ds = new DecompressionStream('deflate-raw');
+            const writer = ds.writable.getWriter();
+            writer.write(rawEntry).catch(() => {});
+            writer.close().catch(() => {});
+            const decompressedBuf = await new Response(ds.readable).arrayBuffer();
+            const decompressedBytes = new Uint8Array(decompressedBuf);
+            const pngSlice = extractPngSliceFromBytes(decompressedBytes) || decompressedBytes;
+            return `data:image/png;base64,${uint8ToBase64(pngSlice)}`;
+        }
+    }
+
+    // 3. Raw PNG or embedded PNG bytes
+    const pngSlice = extractPngSliceFromBytes(bytes);
+    if (pngSlice) {
+        return `data:image/png;base64,${uint8ToBase64(pngSlice)}`;
+    }
+
+    // 4. Plain base64 text response
+    const asText = new TextDecoder().decode(bytes).trim();
+    if (asText.startsWith('data:image/') || /^[A-Za-z0-9+/=\r\n]+$/.test(asText.slice(0, 128))) {
+        return asText.startsWith('data:') ? asText : `data:image/png;base64,${asText}`;
+    }
+
+    throw new Error(`Не удалось извлечь PNG из ответа NovelAI (${bytes.length} байт)`);
+}
+
 async function generateImageNovelAI(prompt, style, options = {}) {
     const settings = getSettings();
     if (settings.apiKey) {
@@ -4538,23 +4688,148 @@ async function generateImageNovelAI(prompt, style, options = {}) {
     const scale = Number.isFinite(Number(settings.novelScale)) ? Number(settings.novelScale) : 5;
     const seedVal = Number(settings.novelSeed);
     const seed = Number.isInteger(seedVal) && seedVal >= 0 ? seedVal : undefined;
+    const resolvedSeed = seed !== undefined ? seed : Math.floor(Math.random() * 4294967295);
 
     const sm = !isV4 && sampler !== 'ddim' && Boolean(settings.novelSm);
     const sm_dyn = sm && Boolean(settings.novelSmDyn);
     const canUpscale = ['nai-diffusion-2', 'nai-diffusion-3', 'nai-diffusion-furry-3'].includes(model) && !anlasGuard;
     const upscale_ratio = canUpscale ? (Number(settings.novelUpscale) || 1) : 1;
 
-    // Strip [STYLE: ...] wrapper so NovelAI doesn't interpret square brackets as de-emphasis
-    const cleanPrompt = String(prompt || '').replace(STYLE_BLOCK_RE, '').trim();
-    const cleanStyle = String(style || '').trim();
-    const prefix = String(settings.novelPrefix || '').trim();
-    const fullPrompt = [prefix, cleanStyle, cleanPrompt]
+    const combinedNegative = [String(settings.novelNegative || '').trim(), String(options.uc || '').trim()]
         .map(s => s.replace(/^[\s,]+|[\s,]+$/g, ''))
         .filter(Boolean)
         .join(', ');
 
+    const { basePrompt: cleanPrompt, baseNegative, parsedChars, hasCoords } = parseNovelAICharacters(prompt, combinedNegative, options);
+    const cleanStyle = String(style || '').trim();
+    const prefix = String(settings.novelPrefix || '').trim();
+    const fullBasePrompt = [prefix, cleanStyle, cleanPrompt]
+        .map(s => s.replace(/^[\s,]+|[\s,]+$/g, ''))
+        .filter(Boolean)
+        .join(', ');
+
+    const characterPrompts = parsedChars.map(c => ({
+        prompt: c.prompt,
+        uc: c.uc,
+        center: c.center,
+        enabled: true,
+    }));
+
+    const v4_prompt = {
+        caption: {
+            base_caption: fullBasePrompt,
+            char_captions: parsedChars.map(c => ({
+                char_caption: c.prompt,
+                centers: [c.center],
+            })),
+        },
+        use_coords: hasCoords,
+        use_order: true,
+    };
+
+    const v4_negative_prompt = {
+        caption: {
+            base_caption: baseNegative,
+            char_captions: parsedChars.map(c => ({
+                char_caption: c.uc,
+                centers: [c.center],
+            })),
+        },
+        legacy_uc: false,
+    };
+
+    iigLog('INFO', `NovelAI: model=${model}, size=${width}x${height}, steps=${steps}, scale=${scale}, sampler=${sampler}, scheduler=${scheduler}, chars=${parsedChars.length}, coords=${hasCoords}, anlasGuard=${anlasGuard}`);
+
+    // Primary path when API key is available in SLAY settings AND we have multi-character prompts (or V4/V5):
+    // Call https://image.novelai.net/ai/generate-image directly because SillyTavern's built-in
+    // /api/novelai/generate-image endpoint hardcodes characterPrompts: [] and char_captions: [],
+    // which strips all character descriptions and coordinates.
+    const directKey = String(settings.apiKey || '').trim();
+    if (directKey && isV4 && parsedChars.length > 0 && upscale_ratio <= 1) {
+        const naiParameters = {
+            params_version: isV5 ? 4 : 3,
+            prefer_brownian: true,
+            negative_prompt: baseNegative,
+            height,
+            width,
+            scale,
+            seed: resolvedSeed,
+            sampler,
+            noise_schedule: isV5 ? 'karras' : scheduler,
+            steps,
+            n_samples: 1,
+            ucPreset: 0,
+            qualityToggle: false,
+            add_original_image: false,
+            controlnet_strength: 1,
+            deliberate_euler_ancestral_bug: false,
+            dynamic_thresholding: isV5 ? false : Boolean(settings.novelDecrisper),
+            legacy: false,
+            legacy_v3_extend: false,
+            sm: false,
+            sm_dyn: false,
+            uncond_scale: 1,
+            skip_cfg_above_sigma: (!isV5 && settings.novelVarietyBoost)
+                ? Math.pow((width * height) / 1011712, 0.5) * (model.includes('nai-diffusion-4-5') ? 58 : 19)
+                : null,
+            use_coords: hasCoords,
+            legacy_uc: false,
+            characterPrompts,
+            reference_image_multiple: [],
+            reference_information_extracted_multiple: [],
+            reference_strength_multiple: [],
+            v4_negative_prompt,
+            v4_prompt,
+        };
+        if (isV5) {
+            naiParameters.prompt = fullBasePrompt;
+            naiParameters.extra_noise_seed = resolvedSeed;
+        }
+
+        try {
+            const directResp = await robustFetch('https://image.novelai.net/ai/generate-image', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${directKey}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    action: 'generate',
+                    input: fullBasePrompt,
+                    model,
+                    parameters: naiParameters,
+                }),
+            });
+
+            if (directResp.ok) {
+                const buf = await directResp.arrayBuffer();
+                return await extractNovelAIImageFromArrayBuffer(buf);
+            }
+            const errText = await directResp.text().catch(() => '');
+            if (directResp.status === 401 || directResp.status === 402 || directResp.status === 429) {
+                throw new Error(`NovelAI Error (${directResp.status}): ${errText || directResp.statusText}`);
+            }
+            iigLog('WARN', `NovelAI direct API returned ${directResp.status} (${errText.slice(0, 120)}), falling back to ST backend with merged character prompts`);
+        } catch (directErr) {
+            if (/NovelAI Error \((?:401|402|429)\)/.test(String(directErr?.message || ''))) {
+                throw directErr;
+            }
+            iigLog('WARN', `NovelAI direct fetch fallback (${directErr?.message || directErr}) — using ST backend with merged character prompts`);
+        }
+    }
+
+    // Fallback / single-prompt path via SillyTavern's /api/novelai/generate-image:
+    // Merge character prompts into base prompt and character UCs into negative_prompt so
+    // ST's backend never drops character descriptions even when char_captions is hardcoded to [].
+    const mergedFallbackPrompt = [fullBasePrompt, ...parsedChars.map(c => c.prompt)]
+        .filter(Boolean)
+        .join(', ');
+    const mergedFallbackNegative = [baseNegative, ...parsedChars.map(c => c.uc)]
+        .filter(Boolean)
+        .join(', ');
+
     const body = {
-        prompt: fullPrompt,
+        prompt: mergedFallbackPrompt,
         model,
         sampler,
         scheduler,
@@ -4562,16 +4837,18 @@ async function generateImageNovelAI(prompt, style, options = {}) {
         scale,
         width,
         height,
-        negative_prompt: String(settings.novelNegative || '').trim(),
+        negative_prompt: mergedFallbackNegative,
         upscale_ratio,
         decrisper: isV5 ? false : Boolean(settings.novelDecrisper),
         variety_boost: isV5 ? false : Boolean(settings.novelVarietyBoost),
         sm,
         sm_dyn,
         seed,
+        use_coords: hasCoords,
+        characterPrompts,
+        v4_prompt,
+        v4_negative_prompt,
     };
-
-    iigLog('INFO', `NovelAI: model=${model}, size=${width}x${height}, steps=${steps}, scale=${scale}, sampler=${sampler}, scheduler=${scheduler}, anlasGuard=${anlasGuard}`);
 
     const response = await robustFetch('/api/novelai/generate-image', {
         method: 'POST',
@@ -5308,11 +5585,12 @@ function findLiveImgByInstruction(detachedImg) {
 function normalizeIigInstructionData(rawData, mediaEl = null) {
     let d = rawData;
     if (typeof d === 'string') {
-        try { d = JSON.parse(d); } catch (_) { return { prompt: d, style: '' }; }
+        try { d = JSON.parse(d); } catch (_) { return { prompt: d, style: '', characters: [], uc: '', bubbles: [] }; }
     }
     if (!d || typeof d !== 'object') d = {};
     let prompt = d.prompt ?? d.Prompt ?? d.PROMPT ?? d.promt ?? d.Promt ?? d.propmt ?? d.promp ?? d.prmpt
         ?? d['промпт'] ?? d['промт'] ?? d.positive ?? d.positive_prompt ?? d.image_prompt ?? d.imagePrompt
+        ?? d.base ?? d.Base ?? d.BASE ?? d.base_caption ?? d.v4_prompt?.caption?.base_caption
         ?? d.description ?? d.Description ?? d.tags ?? d.text ?? d.scene ?? d.query ?? d.caption
         ?? d.parameters?.prompt ?? d.data?.prompt ?? '';
     if (!prompt) {
@@ -5324,6 +5602,33 @@ function normalizeIigInstructionData(rawData, mediaEl = null) {
             }
         }
     }
+
+    const rawChars = Array.isArray(d.characters) ? d.characters
+        : (Array.isArray(d.characterPrompts) ? d.characterPrompts
+            : (Array.isArray(d.v4_prompt?.caption?.char_captions) ? d.v4_prompt.caption.char_captions : []));
+    const characters = rawChars.map(c => {
+        if (!c) return null;
+        if (typeof c === 'string') {
+            const cp = c.trim();
+            return cp ? { name: '', prompt: cp, uc: '', center: null } : null;
+        }
+        const cp = String(c.prompt ?? c.char_caption ?? c.tags ?? c.description ?? '').trim();
+        if (!cp) return null;
+        const uc = String(c.uc ?? c.negative ?? c.negative_prompt ?? '').trim();
+        const centerRaw = c.center ?? (Array.isArray(c.centers) ? c.centers[0] : null);
+        const cx = Number(centerRaw?.x);
+        const cy = Number(centerRaw?.y);
+        const center = (centerRaw != null && Number.isFinite(cx) && Number.isFinite(cy))
+            ? { x: cx, y: cy }
+            : null;
+        return {
+            name: String(c.name ?? c.char ?? c.character ?? '').trim(),
+            prompt: cp,
+            uc,
+            center,
+        };
+    }).filter(Boolean);
+
     let style = d.style ?? d.Style ?? d.STYLE ?? '';
     if (!prompt && mediaEl && typeof mediaEl.getAttribute === 'function') {
         const attrPrompt = mediaEl.getAttribute('prompt') || mediaEl.getAttribute('data-prompt') || mediaEl.getAttribute('alt') || '';
@@ -5339,10 +5644,18 @@ function normalizeIigInstructionData(rawData, mediaEl = null) {
         prompt = style;
         style = '';
     }
+    if (!prompt && characters.length > 0) {
+        prompt = characters.map(c => c.prompt).join(', ');
+    }
+    const uc = String(d.uc ?? d.negative_prompt ?? d.negative ?? '');
+    const bubbles = Array.isArray(d.bubbles) ? d.bubbles : [];
     return {
         ...d,
         prompt: String(prompt ?? ''),
         style: String(style ?? ''),
+        characters,
+        uc,
+        bubbles,
         aspect_ratio: d.aspect_ratio || d.aspectRatio || null,
         image_size: d.image_size || d.imageSize || null,
         quality: d.quality || null,
@@ -5444,7 +5757,9 @@ function attachRegenButton(imgEl) {
         try {
             const result = await generateImageWithRetry(data.prompt, data.style, (s) => { if (overlayLabel?.isConnected) overlayLabel.textContent = s; }, {
                 aspectRatio: data.aspect_ratio, imageSize: data.image_size,
-                quality: data.quality, preset: data.preset, messageId,
+                quality: data.quality, preset: data.preset,
+                characters: data.characters, uc: data.uc, bubbles: data.bubbles,
+                messageId,
             });
             if (overlayLabel?.isConnected) overlayLabel.textContent = 'Сохранение...';
             if (overlayTimer?.isConnected) overlayTimer.textContent = '';
@@ -5639,6 +5954,18 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     // Normalize the prompt BEFORE name-matching and before it's sent to the API.
     // This is the single chokepoint where charInPrompt/userInPrompt are computed
     // and where the request body is built, so decoding here fixes both.
+    const rawOptionsChars = Array.isArray(options.characters) ? options.characters : [];
+    const normalizedChars = rawOptionsChars.map(c => {
+        if (!c || typeof c !== 'object') return c;
+        return {
+            ...c,
+            name: decodeNumericEntities(String(c.name || '')),
+            prompt: decodeNumericEntities(String(c.prompt || '')),
+            uc: decodeNumericEntities(String(c.uc || '')),
+        };
+    });
+    options = { ...options, characters: normalizedChars };
+
     {
         const _before = prompt;
         prompt = decodeNumericEntities(prompt);
@@ -5646,6 +5973,9 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             const m = (_before.match(/&#x?[0-9a-fA-F]+;/g) || []).slice(0, 6).join(' ');
             iigLog('INFO', `decoded numeric HTML entities in prompt (sample: ${m}) — Cyrillic names should now match`);
         }
+    }
+    if (!prompt.trim() && normalizedChars.length > 0) {
+        prompt = normalizedChars.map(c => c?.prompt || '').filter(Boolean).join(', ');
     }
     if (!prompt.trim()) {
         throw new Error('В теге картинки пустой промпт — нейросеть (LLM) не записала описание сцены в тег');
@@ -5669,7 +5999,11 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     const refs = getCurrentCharacterRefs();
     const charDisplayName = getDefaultCharRefName(refs);
     const userDisplayName = getDefaultUserRefName(refs);
-    const lowerPrompt = prompt.toLowerCase();
+    const fullSearchText = [
+        prompt,
+        ...normalizedChars.map(c => `${c?.name || ''} ${c?.prompt || ''}`),
+    ].join(' ');
+    const lowerPrompt = fullSearchText.toLowerCase();
     const charInPrompt = nameIsInPrompt(charDisplayName, lowerPrompt);
     const userInPrompt = nameIsInPrompt(userDisplayName, lowerPrompt);
     // Refs ship only when their owner is explicitly named in the image prompt. This restores
@@ -5732,7 +6066,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         }
 
         // 4. Matched NPCs
-        const matchedNpcs = matchNpcReferences(prompt, refs.npcReferences || []);
+        const matchedNpcs = matchNpcReferences(fullSearchText, refs.npcReferences || []);
         for (const npc of matchedNpcs) {
             if (!canPush()) break;
             const b64 = npc.imagePath ? await loadRefImageAsBase64(npc.imagePath) : (npc.imageBase64 || npc.imageData);
@@ -5798,7 +6132,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             }
         }
         // 4. NPC faces (matched against prompt)
-        const matchedNpcs = matchNpcReferences(prompt, refs.npcReferences || []);
+        const matchedNpcs = matchNpcReferences(fullSearchText, refs.npcReferences || []);
         for (const npc of matchedNpcs) {
             if (!canPush()) break;
             const url = await getDataUrl(npc);
@@ -5834,8 +6168,23 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         iigLog('INFO', `Wardrobe user desc (${userDesc.length} chars): ${userDesc.substring(0, 150)}`);
         const wardrobeParts = [];
         if (settings.apiType === 'novelai') {
-            if (botDesc && charInPrompt) wardrobeParts.push(botDesc);
-            if (userDesc && userInPrompt) wardrobeParts.push(userDesc);
+            let botInjectedToChar = false;
+            let userInjectedToChar = false;
+            if (normalizedChars.length > 0) {
+                for (const c of normalizedChars) {
+                    const cText = `${c?.name || ''} ${c?.prompt || ''}`.toLowerCase();
+                    if (botDesc && charInPrompt && !botInjectedToChar && nameIsInPrompt(charDisplayName, cText)) {
+                        c.prompt = `${botDesc}, ${c.prompt}`;
+                        botInjectedToChar = true;
+                    }
+                    if (userDesc && userInPrompt && !userInjectedToChar && nameIsInPrompt(userDisplayName, cText)) {
+                        c.prompt = `${userDesc}, ${c.prompt}`;
+                        userInjectedToChar = true;
+                    }
+                }
+            }
+            if (botDesc && charInPrompt && !botInjectedToChar) wardrobeParts.push(botDesc);
+            if (userDesc && userInPrompt && !userInjectedToChar) wardrobeParts.push(userDesc);
         } else {
             if (botDesc && charInPrompt) wardrobeParts.push(`[Clothing reference only, avoid copying the pose] [Character's current outfit: ${botDesc}]`);
             if (userDesc && userInPrompt) wardrobeParts.push(`[Clothing reference only, avoid copying the pose] [User's current outfit: ${userDesc}]`);
@@ -5845,6 +6194,16 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
                 ? `${wardrobeParts.join(', ')}, ${prompt}`
                 : `${wardrobeParts.join(' ')}\n${prompt}`;
             iigLog('INFO', `Wardrobe v4 descriptions injected: ${wardrobeParts.join(' | ').substring(0, 200)}`);
+        }
+    }
+
+    // For non-NovelAI providers, append structured characters array into prompt text so descriptions aren't lost
+    if (settings.apiType !== 'novelai' && normalizedChars.length > 0) {
+        const charLines = normalizedChars
+            .filter(c => c?.prompt)
+            .map((c, idx) => `${c.name || `Character ${idx + 1}`}: ${c.prompt}`);
+        if (charLines.length > 0) {
+            prompt = `${prompt}\nCharacters:\n${charLines.join('\n')}`;
         }
     }
 
@@ -5961,7 +6320,7 @@ async function parseImageTags(text, options = {}) {
         try {
             let normalizedJson = instructionJson.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#39;/g, "'").replace(/&#34;/g, '"').replace(/&amp;/g, '&');
             const data = normalizeIigInstructionData(JSON.parse(normalizedJson));
-            tags.push({ fullMatch: fullImgTag, index: mediaStart, style: data.style || '', prompt: data.prompt || '', aspectRatio: data.aspect_ratio || data.aspectRatio || null, preset: data.preset || null, imageSize: data.image_size || data.imageSize || null, quality: data.quality || null, isNewFormat: true, mediaTagName: tagName, existingSrc: hasPath ? srcValue : null });
+            tags.push({ fullMatch: fullImgTag, index: mediaStart, style: data.style || '', prompt: data.prompt || '', characters: data.characters || [], uc: data.uc || '', bubbles: data.bubbles || [], aspectRatio: data.aspect_ratio || data.aspectRatio || null, preset: data.preset || null, imageSize: data.image_size || data.imageSize || null, quality: data.quality || null, isNewFormat: true, mediaTagName: tagName, existingSrc: hasPath ? srcValue : null });
             iigLog('INFO', `Found NEW tag: ${data.prompt?.substring(0, 50)}`);
         } catch (e) { iigLog('WARN', `Parse failed: ${instructionJson.substring(0, 100)}`); }
         searchPos = mediaEnd;
@@ -5988,7 +6347,7 @@ async function parseImageTags(text, options = {}) {
         const tagOnly = text.substring(markerIndex, jsonEnd + 1);
         try {
             const data = normalizeIigInstructionData(JSON.parse(jsonStr.replace(/'/g, '"')));
-            tags.push({ fullMatch: tagOnly, index: markerIndex, style: data.style || '', prompt: data.prompt || '', aspectRatio: data.aspect_ratio || data.aspectRatio || null, preset: data.preset || null, imageSize: data.image_size || data.imageSize || null, quality: data.quality || null, isNewFormat: false });
+            tags.push({ fullMatch: tagOnly, index: markerIndex, style: data.style || '', prompt: data.prompt || '', characters: data.characters || [], uc: data.uc || '', bubbles: data.bubbles || [], aspectRatio: data.aspect_ratio || data.aspectRatio || null, preset: data.preset || null, imageSize: data.image_size || data.imageSize || null, quality: data.quality || null, isNewFormat: false });
             iigLog('INFO', `Found LEGACY tag: ${data.prompt?.substring(0, 50)}`);
         } catch (e) { iigLog('WARN', `Legacy parse failed: ${jsonStr.substring(0, 100)}`); }
         searchStart = jsonEnd + 1;
@@ -6188,7 +6547,7 @@ async function retryFailedGeneration(errorEl, instructionJsonStr) {
     try {
         const result = await generateImageWithRetry(data.prompt, data.style,
             (s) => { if (labelEl?.isConnected) labelEl.textContent = s; },
-            { aspectRatio: data.aspect_ratio, imageSize: data.image_size, quality: data.quality, preset: data.preset, messageId });
+            { aspectRatio: data.aspect_ratio, imageSize: data.image_size, quality: data.quality, preset: data.preset, characters: data.characters, uc: data.uc, bubbles: data.bubbles, messageId });
         if (labelEl?.isConnected) labelEl.textContent = 'Сохранение...';
         if (timerEl?.isConnected) timerEl.textContent = '';
         const imagePath = isGeneratedVideoResult(result)
@@ -6296,7 +6655,7 @@ async function processMessageTags(messageId) {
                     const decoded = instruction.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#39;/g, "'").replace(/&#34;/g, '"').replace(/&amp;/g, '&');
                     const normalizedSearch = searchPrompt.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#39;/g, "'").replace(/&#34;/g, '"').replace(/&amp;/g, '&');
                     if (decoded.includes(normalizedSearch)) { targetElement = img; break; }
-                    try { const d = JSON.parse(decoded.replace(/'/g, '"')); if (d.prompt?.substring(0, 30) === tag.prompt.substring(0, 30)) { targetElement = img; break; } } catch (e) { }
+                    try { const d = JSON.parse(decoded.replace(/'/g, '"')); if ((d.prompt || d.base || '')?.substring(0, 30) === tag.prompt.substring(0, 30)) { targetElement = img; break; } } catch (e) { }
                     if (instruction.includes(searchPrompt)) { targetElement = img; break; }
                 }
             }
@@ -6321,7 +6680,7 @@ async function processMessageTags(messageId) {
         const labelEl = loadingPlaceholder.querySelector('.iig-status-label') || statusEl;
         const timerEl = loadingPlaceholder.querySelector('.iig-status-timer');
         try {
-            const result = await generateImageWithRetry(tag.prompt, tag.style, (s) => { labelEl.textContent = s; }, { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId });
+            const result = await generateImageWithRetry(tag.prompt, tag.style, (s) => { labelEl.textContent = s; }, { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, characters: tag.characters, uc: tag.uc, bubbles: tag.bubbles, messageId });
 
             labelEl.textContent = 'Сохранение...';
             if (timerEl) timerEl.textContent = '';
@@ -6437,7 +6796,7 @@ async function regenerateMessageImages(messageId) {
                 const statusEl = loadingPlaceholder.querySelector('.iig-status');
                 const labelEl = loadingPlaceholder.querySelector('.iig-status-label') || statusEl;
                 const timerEl = loadingPlaceholder.querySelector('.iig-status-timer');
-                const result = await generateImageWithRetry(tag.prompt, tag.style, (s) => { labelEl.textContent = s; }, { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId });
+                const result = await generateImageWithRetry(tag.prompt, tag.style, (s) => { labelEl.textContent = s; }, { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, characters: tag.characters, uc: tag.uc, bubbles: tag.bubbles, messageId });
                 labelEl.textContent = 'Сохранение...';
                 if (timerEl) timerEl.textContent = '';
 
